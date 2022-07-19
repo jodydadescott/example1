@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -129,7 +130,7 @@ func (t *Operator) init(ctx context.Context) error {
 
 func (t *Operator) getPrismaConfig(ctx context.Context) (*prisma_types.PrismaConfig, error) {
 
-	masterPods, err := t.kubeClient.CoreV1().Pods("").List(ctx, t.masterListOptions)
+	masterNodes, err := t.kubeClient.CoreV1().Nodes().List(ctx, t.masterListOptions)
 
 	if err != nil {
 		return nil, err
@@ -137,34 +138,53 @@ func (t *Operator) getPrismaConfig(ctx context.Context) (*prisma_types.PrismaCon
 
 	prismaConfig := prisma_types.NewPrismaConfig(t.prismaLabel)
 
-	for _, pod := range masterPods.Items {
+	for _, node := range masterNodes.Items {
 
-		hostname := pod.Spec.Hostname
-		podIP := pod.Status.PodIP
+		fmt.Println("node.Name: " + node.Name)
 
-		if podIP == "" {
-			continue
+		filter := k8smetav1.ListOptions{
+			FieldSelector: node.Name,
 		}
 
-		var tags []string
-		tags = append(tags, "externalnetwork:name="+hostname)
-		tags = append(tags, "externalnetwork:name=masterPods")
+		pods, err := t.kubeClient.CoreV1().Pods("").List(ctx, filter)
 
-		var entries []string
-		entries = append(entries, podIP+"/32")
+		if err != nil {
+			return nil, err
+		}
 
-		extNetwork := prisma_types.NewExternalnetwork(hostname).
-			SetDescription("Auto generated").
-			SetEntries(entries).SetAssociatedTags(tags)
+		for _, pod := range pods.Items {
 
-		prismaConfig.AddExternalnetwork(extNetwork)
+			hostname := pod.Spec.Hostname
+			podIP := pod.Status.PodIP
+
+			fmt.Println("hostname: " + hostname)
+			fmt.Println("podIP: " + podIP)
+
+			if podIP == "" {
+				continue
+			}
+
+			var tags []string
+			tags = append(tags, "externalnetwork:name="+hostname)
+			tags = append(tags, "externalnetwork:name=masterPods")
+
+			var entries []string
+			entries = append(entries, podIP+"/32")
+
+			extNetwork := prisma_types.NewExternalnetwork(hostname).
+				SetDescription("Auto generated").
+				SetEntries(entries).SetAssociatedTags(tags)
+
+			prismaConfig.AddExternalnetwork(extNetwork)
+		}
+
 	}
 
 	// infraPods, err := t.kubeClient.CoreV1().Pods("").List(ctx, t.infraListOptions)
 
-	// if err != nil {
-	// 	return nil, err
-	// }
+	if err != nil {
+		return nil, err
+	}
 
 	return prismaConfig, nil
 }
