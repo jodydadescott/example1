@@ -19,10 +19,12 @@ func run() error {
 
 	ctx := context.Background()
 
-	config := &operator.Config{}
-	config.PrismaAPI = "https://api.east-01.network.prismacloud.io"
-	config.PrismaLabel = "my-label"
-	config.PrismaNamespace = "my-namespace"
+	config := operator.NewConfig().
+		SetPrismaAPI("https://api.east-01.network.prismacloud.io").
+		SetPrismaLabel("my-label").
+		SetPrismaNamespace("my-namespace").
+		AddLabelSelectors("node-role.kubernetes.io/master=").
+		AddLabelSelectors("node-role.kubernetes.io/infra=")
 
 	op, err := operator.NewOperator(ctx, config)
 	if err != nil {

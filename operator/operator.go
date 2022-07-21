@@ -3,12 +3,14 @@ package operator
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 
 	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
 	prisma_api "github.com/aporeto-se/prisma-sdk-go-v2/api"
@@ -27,8 +29,7 @@ type Operator struct {
 	kubeClient      *kubernetes.Clientset
 	prismaClient    *prisma_api.Client
 
-	masterListOptions k8smetav1.ListOptions
-	infraListOptions  k8smetav1.ListOptions
+	labelselectors []k8smetav1.ListOptions
 }
 
 // NewOperator ...
@@ -46,6 +47,10 @@ func NewOperator(ctx context.Context, config *Config) (*Operator, error) {
 		panic("PrismaNamespace is required")
 	}
 
+	if len(config.LabelSelectors) <= 0 {
+		panic("LabelSelectors must have one or more entries")
+	}
+
 	httpClient := config.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{}
@@ -58,12 +63,13 @@ func NewOperator(ctx context.Context, config *Config) (*Operator, error) {
 		httpClient:      httpClient,
 	}
 
-	t.masterListOptions = k8smetav1.ListOptions{
-		LabelSelector: "node-role.kubernetes.io/master=",
-	}
+	// node-role.kubernetes.io/master=
+	// node-role.kubernetes.io/infra=
 
-	t.infraListOptions = k8smetav1.ListOptions{
-		LabelSelector: "node-role.kubernetes.io/infra=",
+	for _, labelSelector := range config.LabelSelectors {
+		t.labelselectors = append(t.labelselectors, k8smetav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
 	}
 
 	err := t.init(ctx)
@@ -92,16 +98,7 @@ func (t *Operator) Run(ctx context.Context) error {
 
 func (t *Operator) init(ctx context.Context) error {
 
-	kubeconfig := filepath.Join(
-		os.Getenv("HOME"), ".kube", "config",
-	)
-
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-	if err != nil {
-		return err
-	}
-
-	kubeClient, err := kubernetes.NewForConfig(config)
+	kubeClient, err := newKubeClientWithHomeConfig()
 	if err != nil {
 		return err
 	}
@@ -128,19 +125,64 @@ func (t *Operator) init(ctx context.Context) error {
 	return nil
 }
 
+func newKubeClientWithHomeConfig() (*kubernetes.Clientset, error) {
+
+	kubeconfig := filepath.Join(
+		os.Getenv("HOME"), ".kube", "config",
+	)
+
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return kubernetes.NewForConfig(config)
+}
+
+func newKubeClientWithInCluster(ctx context.Context) (*kubernetes.Clientset, error) {
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	return kubernetes.NewForConfig(config)
+}
+
 func (t *Operator) getPrismaConfig(ctx context.Context) (*prisma_types.PrismaConfig, error) {
 
-	masterNodes, err := t.kubeClient.CoreV1().Nodes().List(ctx, t.masterListOptions)
+	config := prisma_types.NewPrismaConfig(t.prismaLabel)
+
+	for _, labelselector := range t.labelselectors {
+
+		extNetworks, err := t.getExternalNetworksWithSelector(ctx, labelselector)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, extNetwork := range extNetworks {
+			config.AddExternalnetwork(extNetwork)
+		}
+
+	}
+
+	return config, nil
+}
+
+// masterNodeList, err := clientset.CoreV1().Nodes().List(ctx, opts)
+
+func (t *Operator) getExternalNetworksWithSelector(ctx context.Context, labelSelector k8smetav1.ListOptions) ([]*prisma_types.Externalnetwork, error) {
+
+	var externalNetworks []*prisma_types.Externalnetwork
+
+	nodes, err := t.kubeClient.CoreV1().Nodes().List(ctx, labelSelector)
 
 	if err != nil {
 		return nil, err
 	}
 
-	prismaConfig := prisma_types.NewPrismaConfig(t.prismaLabel)
+	for _, node := range nodes.Items {
 
-	for _, node := range masterNodes.Items {
-
-		fmt.Println("node.Name: " + node.Name)
+		log.Println("node.Name:", node.Name)
 
 		filter := k8smetav1.ListOptions{
 			FieldSelector: node.Name,
@@ -157,12 +199,18 @@ func (t *Operator) getPrismaConfig(ctx context.Context) (*prisma_types.PrismaCon
 			hostname := pod.Spec.Hostname
 			podIP := pod.Status.PodIP
 
-			fmt.Println("hostname: " + hostname)
-			fmt.Println("podIP: " + podIP)
-
-			if podIP == "" {
+			if hostname == "" {
+				log.Println("Pod missing hostname")
 				continue
 			}
+
+			if podIP == "" {
+				log.Println(fmt.Sprintf("Pod %s not added because it has no IP", hostname))
+				continue
+			}
+
+			log.Println("hostname:", hostname)
+			log.Println("podIP:", podIP)
 
 			var tags []string
 			tags = append(tags, "externalnetwork:name="+hostname)
@@ -175,18 +223,10 @@ func (t *Operator) getPrismaConfig(ctx context.Context) (*prisma_types.PrismaCon
 				SetDescription("Auto generated").
 				SetEntries(entries).SetAssociatedTags(tags)
 
-			prismaConfig.AddExternalnetwork(extNetwork)
+			externalNetworks = append(externalNetworks, extNetwork)
 		}
 
 	}
 
-	// infraPods, err := t.kubeClient.CoreV1().Pods("").List(ctx, t.infraListOptions)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return prismaConfig, nil
+	return externalNetworks, nil
 }
-
-// masterNodeList, err := clientset.CoreV1().Nodes().List(ctx, opts)
